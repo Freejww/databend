@@ -19,9 +19,12 @@ use databend_common_expression::DataSchemaRef;
 use databend_common_expression::SortColumnDescription;
 use databend_common_pipeline_core::processors::ProcessorPtr;
 use databend_common_pipeline_core::query_spill_prefix;
+use databend_common_pipeline_core::Pipe;
+use databend_common_pipeline_core::PipeItem;
 use databend_common_pipeline_core::Pipeline;
 use databend_common_pipeline_transforms::processors::sort::utils::add_order_field;
 use databend_common_pipeline_transforms::processors::try_add_multi_sort_merge;
+use databend_common_pipeline_transforms::processors::TransformSortAggregateShuffle;
 use databend_common_pipeline_transforms::processors::TransformSortMergeBuilder;
 use databend_common_pipeline_transforms::processors::TransformSortPartial;
 use databend_common_sql::evaluator::BlockOperator;
@@ -312,6 +315,92 @@ impl SortPipelineBuilder {
                 self.remove_order_col_at_last,
             )?;
         }
+
+        Ok(())
+    }
+
+    pub fn build_sort_and_shuffle_pipeline(self, pipeline: &mut Pipeline) -> Result<()> {
+        // Partial sort
+        pipeline.add_transform(|input, output| {
+            Ok(ProcessorPtr::create(TransformSortPartial::try_create(
+                input,
+                output,
+                None,
+                self.sort_desc.clone(),
+            )?))
+        })?;
+
+        // Merge sort
+        let output_len = pipeline.output_len();
+        let need_multi_merge = output_len > 1;
+
+        // Need output order col for sort aggregate
+        let output_order_col = true;
+        debug_assert!(!self.remove_order_col_at_last);
+
+        let (max_memory_usage, bytes_limit_per_proc) =
+            self.get_memory_settings(pipeline.output_len())?;
+
+        let may_spill = max_memory_usage != 0 && bytes_limit_per_proc != 0;
+
+        let sort_merge_output_schema = add_order_field(self.schema.clone(), &self.sort_desc);
+
+        pipeline.add_transform(|input, output| {
+            let builder = TransformSortMergeBuilder::create(
+                input,
+                output,
+                sort_merge_output_schema.clone(),
+                self.sort_desc.clone(),
+                self.partial_block_size,
+            )
+            .with_output_order_col(output_order_col)
+            .with_max_memory_usage(max_memory_usage)
+            .with_spilling_bytes_threshold_per_core(bytes_limit_per_proc);
+
+            Ok(ProcessorPtr::create(builder.build()?))
+        })?;
+
+        if may_spill {
+            let config = SpillerConfig::create(query_spill_prefix(self.ctx.get_tenant().name()));
+            pipeline.add_transform(|input, output| {
+                let op = DataOperator::instance().operator();
+                let spiller =
+                    Spiller::create(self.ctx.clone(), op, config.clone(), SpillerType::OrderBy)?;
+                Ok(ProcessorPtr::create(create_transform_sort_spill(
+                    input,
+                    output,
+                    sort_merge_output_schema.clone(),
+                    self.sort_desc.clone(),
+                    None,
+                    spiller,
+                    output_order_col,
+                )))
+            })?;
+        }
+
+        if need_multi_merge {
+            // Multi-pipelines merge sort
+            try_add_multi_sort_merge(
+                pipeline,
+                sort_merge_output_schema,
+                self.final_block_size,
+                self.limit,
+                self.sort_desc,
+                self.remove_order_col_at_last,
+            )?;
+        }
+
+        debug_assert!(pipeline.output_len() == 1);
+        // Shuffle
+        let transform = TransformSortAggregateShuffle::create(output_len)?;
+        let input = transform.get_input();
+        let outputs = transform.get_outputs();
+
+        pipeline.add_pipe(Pipe::create(1, output_len, vec![PipeItem::create(
+            ProcessorPtr::create(Box::new(transform)),
+            vec![input],
+            outputs,
+        )]));
 
         Ok(())
     }

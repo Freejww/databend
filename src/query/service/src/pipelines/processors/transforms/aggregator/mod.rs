@@ -25,6 +25,7 @@ mod transform_group_by_final;
 mod transform_group_by_partial;
 mod transform_partition_bucket;
 mod transform_single_key;
+mod transform_sort_aggregate;
 mod utils;
 
 pub use aggregate_cell::HashTableCell;
@@ -40,6 +41,7 @@ pub use transform_group_by_partial::TransformPartialGroupBy;
 pub use transform_partition_bucket::build_partition_bucket;
 pub use transform_single_key::FinalSingleStateAggregator;
 pub use transform_single_key::PartialSingleStateAggregator;
+pub use transform_sort_aggregate::*;
 pub use utils::*;
 
 pub use self::serde::*;

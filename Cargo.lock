@@ -3803,6 +3803,7 @@ dependencies = [
  "match-template",
  "rand 0.8.5",
  "serde",
+ "strength_reduce",
  "typetag",
 ]
 

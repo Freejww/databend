@@ -23,6 +23,8 @@ use strength_reduce::StrengthReducedU64;
 
 use super::payload_row::rowformat_size;
 use super::payload_row::serialize_column_to_rowformat;
+use super::payload_row::sort_serialize_column_to_rowformat;
+use super::sort_aggregate::SortProbeState;
 use crate::get_layout_offsets;
 use crate::read;
 use crate::store;
@@ -82,7 +84,7 @@ pub struct Page {
 
 pub type Pages = Vec<Page>;
 
-// TODO FIXME
+// Hash
 impl Payload {
     pub fn new(
         arena: Arc<Bump>,
@@ -401,6 +403,147 @@ impl Payload {
             )
             .collect_vec();
         DataBlock::new_from_columns(columns)
+    }
+}
+
+// Sort
+impl Payload {
+    pub fn sort_reserve_append_rows(
+        &mut self,
+        probe_state: &mut SortProbeState,
+        group_columns: &[Column],
+    ) {
+        // Last group point to last group address
+        for idx in probe_state.equal_last_group.index
+            ..probe_state.equal_last_group.index + probe_state.equal_last_group.count
+        {
+            probe_state.addresses[idx] = probe_state.last_group_address;
+        }
+
+        let tuple_size = self.tuple_size;
+        let mut page = self.writable_page();
+        for group in probe_state
+            .group_vector
+            .iter()
+            .take(probe_state.group_count)
+            .copied()
+        {
+            let start = group.index;
+            let end = start + group.count;
+            for idx in start..end {
+                probe_state.addresses[idx] = if idx == start {
+                    unsafe { page.data.as_ptr().add(page.rows * tuple_size) as *const u8 }
+                } else {
+                    probe_state.addresses[start]
+                };
+            }
+
+            page.rows += 1;
+
+            if page.rows == page.capacity {
+                page = self.writable_page();
+            }
+        }
+
+        self.total_rows += probe_state.group_count;
+
+        debug_assert_eq!(
+            self.total_rows,
+            self.pages.iter().map(|x| x.rows).sum::<usize>()
+        );
+
+        self.sort_append_rows(probe_state, group_columns)
+    }
+
+    pub fn sort_append_rows(&mut self, probe_state: &mut SortProbeState, group_columns: &[Column]) {
+        let mut write_offset = 0;
+        // write validity
+        for col in group_columns {
+            if let Column::Nullable(c) = col {
+                let bitmap = &c.validity;
+                if bitmap.unset_bits() == 0 || bitmap.unset_bits() == bitmap.len() {
+                    let val: u8 = if bitmap.unset_bits() == 0 { 1 } else { 0 };
+                    // faster path
+                    for group in probe_state
+                        .group_vector
+                        .iter()
+                        .take(probe_state.group_count)
+                        .copied()
+                    {
+                        unsafe {
+                            let dst = probe_state.addresses[group.index].add(write_offset);
+                            store::<u8>(&val, dst as *mut u8);
+                        }
+                    }
+                } else {
+                    for group in probe_state
+                        .group_vector
+                        .iter()
+                        .take(probe_state.group_count)
+                        .copied()
+                    {
+                        unsafe {
+                            let dst = probe_state.addresses[group.index].add(write_offset);
+                            store::<u8>(&(bitmap.get_bit(group.index) as u8), dst as *mut u8);
+                        }
+                    }
+                }
+                write_offset += 1;
+            }
+        }
+
+        let mut scratch = vec![];
+        for (idx, col) in group_columns.iter().enumerate() {
+            debug_assert!(write_offset == self.group_offsets[idx]);
+
+            unsafe {
+                sort_serialize_column_to_rowformat(
+                    &self.arena,
+                    col,
+                    probe_state,
+                    write_offset,
+                    &mut scratch,
+                );
+            }
+            write_offset += self.group_sizes[idx];
+        }
+
+        // write group hashes
+        debug_assert!(write_offset == self.hash_offset);
+        for group in probe_state
+            .group_vector
+            .iter()
+            .take(probe_state.group_count)
+            .copied()
+        {
+            unsafe {
+                let dst = probe_state.addresses[group.index].add(write_offset);
+                store::<u64>(&probe_state.group_hashes[group.index], dst as *mut u8);
+            }
+        }
+
+        write_offset += 8;
+        debug_assert!(write_offset == self.state_offset);
+        if let Some(layout) = self.state_layout {
+            // write states
+            for group in probe_state
+                .group_vector
+                .iter()
+                .take(probe_state.group_count)
+                .copied()
+            {
+                let place = self.arena.alloc_layout(layout);
+                unsafe {
+                    let dst = probe_state.addresses[group.index].add(write_offset);
+                    store::<u64>(&(place.as_ptr() as u64), dst as *mut u8);
+                }
+
+                let place = StateAddr::from(place);
+                for (aggr, offset) in self.aggrs.iter().zip(self.state_addr_offsets.iter()) {
+                    aggr.init_state(place.next(*offset));
+                }
+            }
+        }
     }
 }
 

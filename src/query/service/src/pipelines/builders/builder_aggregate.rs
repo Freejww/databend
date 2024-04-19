@@ -23,6 +23,7 @@ use databend_common_expression::DataBlock;
 use databend_common_expression::DataSchemaRef;
 use databend_common_expression::HashMethodKind;
 use databend_common_expression::HashTableConfig;
+use databend_common_expression::SortColumnDescription;
 use databend_common_functions::aggregates::AggregateFunctionFactory;
 use databend_common_pipeline_core::processors::ProcessorPtr;
 use databend_common_pipeline_core::query_spill_prefix;
@@ -34,6 +35,7 @@ use databend_common_sql::executor::PhysicalPlan;
 use databend_common_sql::IndexType;
 use databend_common_storage::DataOperator;
 
+use super::SortPipelineBuilder;
 use crate::pipelines::processors::transforms::aggregator::build_partition_bucket;
 use crate::pipelines::processors::transforms::aggregator::AggregateInjector;
 use crate::pipelines::processors::transforms::aggregator::AggregatorParams;
@@ -44,6 +46,7 @@ use crate::pipelines::processors::transforms::aggregator::TransformExpandGroupin
 use crate::pipelines::processors::transforms::aggregator::TransformGroupBySpillWriter;
 use crate::pipelines::processors::transforms::aggregator::TransformPartialAggregate;
 use crate::pipelines::processors::transforms::aggregator::TransformPartialGroupBy;
+use crate::pipelines::processors::transforms::aggregator::TransformSortAggregate;
 use crate::pipelines::PipelineBuilder;
 
 impl PipelineBuilder {
@@ -99,12 +102,15 @@ impl PipelineBuilder {
     pub(crate) fn build_aggregate_partial(&mut self, aggregate: &AggregatePartial) -> Result<()> {
         self.build_pipeline(&aggregate.input)?;
 
-        let max_block_size = self.settings.get_max_block_size()?;
+        let max_block_size = self.settings.get_max_block_size()? as usize;
         let max_threads = self.settings.get_max_threads()?;
 
         let enable_experimental_aggregate_hashtable = self
             .settings
             .get_enable_experimental_aggregate_hashtable()?;
+
+        let enable_experimental_sort_aggregate =
+            self.settings.get_enable_experimental_sort_aggregate()?;
 
         let in_cluster = !self.ctx.get_cluster().is_empty();
 
@@ -113,8 +119,9 @@ impl PipelineBuilder {
             &aggregate.group_by,
             &aggregate.agg_funcs,
             enable_experimental_aggregate_hashtable,
+            enable_experimental_sort_aggregate,
             in_cluster,
-            max_block_size as usize,
+            max_block_size,
             None,
         )?;
 
@@ -140,6 +147,42 @@ impl PipelineBuilder {
             HashTableConfig::default()
                 .cluster_with_partial(true, self.ctx.get_cluster().nodes.len())
         };
+
+        if params.enable_experimental_sort_aggregate {
+            let sort_desc = Arc::new(
+                params
+                    .group_columns
+                    .iter()
+                    .zip(params.group_data_types.iter())
+                    .map(|(offset, ty)| SortColumnDescription {
+                        offset: *offset,
+                        asc: true,
+                        nulls_first: true,
+                        is_nullable: ty.is_nullable(),
+                    })
+                    .collect::<Vec<_>>(),
+            );
+
+            let sort_builder = SortPipelineBuilder::create(
+                self.ctx.clone(),
+                params.input_schema.clone(),
+                sort_desc.clone(),
+            )
+            .with_partial_block_size(max_block_size)
+            .with_final_block_size(max_block_size);
+
+            sort_builder.build_sort_and_shuffle_pipeline(&mut self.main_pipeline)?;
+
+            self.main_pipeline.add_transform(|input, output| {
+                Ok(ProcessorPtr::create(TransformSortAggregate::try_create(
+                    input,
+                    output,
+                    params.clone(),
+                )?))
+            })?;
+
+            return Ok(());
+        }
 
         self.main_pipeline.add_transform(|input, output| {
             Ok(ProcessorPtr::create(
@@ -217,15 +260,22 @@ impl PipelineBuilder {
 
     pub(crate) fn build_aggregate_final(&mut self, aggregate: &AggregateFinal) -> Result<()> {
         let max_block_size = self.settings.get_max_block_size()?;
+
         let enable_experimental_aggregate_hashtable = self
             .settings
             .get_enable_experimental_aggregate_hashtable()?;
+
+        let enable_experimental_sort_aggregate =
+            self.settings.get_enable_experimental_sort_aggregate()?;
+
         let in_cluster = !self.ctx.get_cluster().is_empty();
+
         let params = Self::build_aggregator_params(
             aggregate.before_group_by_schema.clone(),
             &aggregate.group_by,
             &aggregate.agg_funcs,
             enable_experimental_aggregate_hashtable,
+            enable_experimental_sort_aggregate,
             in_cluster,
             max_block_size as usize,
             aggregate.limit,
@@ -292,6 +342,7 @@ impl PipelineBuilder {
         group_by: &[IndexType],
         agg_funcs: &[AggregateFunctionDesc],
         enable_experimental_aggregate_hashtable: bool,
+        enable_experimental_sort_aggregate: bool,
         in_cluster: bool,
         max_block_size: usize,
         limit: Option<usize>,
@@ -334,6 +385,7 @@ impl PipelineBuilder {
             &aggs,
             &agg_args,
             enable_experimental_aggregate_hashtable,
+            enable_experimental_sort_aggregate,
             in_cluster,
             max_block_size,
             limit,

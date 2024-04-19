@@ -24,6 +24,7 @@ mod transform_compact;
 mod transform_dummy;
 mod transform_multi_sort_merge;
 mod transform_sort_merge_base;
+mod transform_sort_shuffle;
 
 mod transform_sort_merge;
 mod transform_sort_merge_limit;
@@ -43,3 +44,4 @@ pub use transform_sort_merge::*;
 pub use transform_sort_merge_base::*;
 pub use transform_sort_merge_limit::*;
 pub use transform_sort_partial::*;
+pub use transform_sort_shuffle::*;

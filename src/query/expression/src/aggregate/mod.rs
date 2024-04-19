@@ -24,6 +24,7 @@ mod payload;
 mod payload_flush;
 mod payload_row;
 mod probe_state;
+mod sort_aggregate;
 
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
@@ -37,6 +38,7 @@ pub use partitioned_payload::*;
 pub use payload::*;
 pub use payload_flush::*;
 pub use probe_state::*;
+pub use sort_aggregate::*;
 
 pub type SelectVector = [usize; BATCH_SIZE];
 

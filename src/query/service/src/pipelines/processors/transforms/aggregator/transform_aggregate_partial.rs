@@ -168,34 +168,6 @@ impl<Method: HashMethodBounds> TransformPartialAggregate<Method> {
         ))
     }
 
-    // Block should be `convert_to_full`.
-    #[inline(always)]
-    fn aggregate_arguments(
-        block: &DataBlock,
-        params: &Arc<AggregatorParams>,
-    ) -> Result<Vec<Vec<Column>>> {
-        let aggregate_functions_arguments = &params.aggregate_functions_arguments;
-        let mut aggregate_arguments_columns =
-            Vec::with_capacity(aggregate_functions_arguments.len());
-        for function_arguments in aggregate_functions_arguments {
-            let mut function_arguments_column = Vec::with_capacity(function_arguments.len());
-
-            for argument_index in function_arguments {
-                // Unwrap safety: chunk has been `convert_to_full`.
-                let argument_column = block
-                    .get_by_offset(*argument_index)
-                    .value
-                    .as_column()
-                    .unwrap();
-                function_arguments_column.push(argument_column.clone());
-            }
-
-            aggregate_arguments_columns.push(function_arguments_column);
-        }
-
-        Ok(aggregate_arguments_columns)
-    }
-
     #[inline(always)]
     #[allow(clippy::ptr_arg)] // &[StateAddr] slower than &StateAddrs ~20%
     fn execute(
@@ -205,7 +177,7 @@ impl<Method: HashMethodBounds> TransformPartialAggregate<Method> {
     ) -> Result<()> {
         let aggregate_functions = &params.aggregate_functions;
         let offsets_aggregate_states = &params.offsets_aggregate_states;
-        let aggregate_arguments_columns = Self::aggregate_arguments(block, params)?;
+        let aggregate_arguments_columns = aggregate_arguments(block, params)?;
 
         // This can beneficial for the case of dereferencing
         // This will help improve the performance ~hundreds of megabits per second
@@ -328,7 +300,7 @@ impl<Method: HashMethodBounds> TransformPartialAggregate<Method> {
                                 .collect(),
                         )
                     } else {
-                        (Self::aggregate_arguments(&block, &self.params)?, vec![])
+                        (aggregate_arguments(&block, &self.params)?, vec![])
                     };
 
                     let _ = hashtable.add_groups(
@@ -484,4 +456,30 @@ impl<Method: HashMethodBounds> AccumulatingTransform for TransformPartialAggrega
             }
         })
     }
+}
+
+// Block should be `convert_to_full`.
+pub fn aggregate_arguments(
+    block: &DataBlock,
+    params: &Arc<AggregatorParams>,
+) -> Result<Vec<Vec<Column>>> {
+    let aggregate_functions_arguments = &params.aggregate_functions_arguments;
+    let mut aggregate_arguments_columns = Vec::with_capacity(aggregate_functions_arguments.len());
+    for function_arguments in aggregate_functions_arguments {
+        let mut function_arguments_column = Vec::with_capacity(function_arguments.len());
+
+        for argument_index in function_arguments {
+            // Unwrap safety: chunk has been `convert_to_full`.
+            let argument_column = block
+                .get_by_offset(*argument_index)
+                .value
+                .as_column()
+                .unwrap();
+            function_arguments_column.push(argument_column.clone());
+        }
+
+        aggregate_arguments_columns.push(function_arguments_column);
+    }
+
+    Ok(aggregate_arguments_columns)
 }

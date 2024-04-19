@@ -443,6 +443,9 @@ pub fn build_partition_bucket<Method: HashMethodBounds, V: Copy + Send + Sync + 
     pipeline: &mut Pipeline,
     params: Arc<AggregatorParams>,
 ) -> Result<()> {
+    if params.enable_experimental_sort_aggregate {
+        return Ok(());
+    }
     if params.enable_experimental_aggregate_hashtable {
         let input_nums = pipeline.output_len();
         let transform =

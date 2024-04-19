@@ -18,6 +18,7 @@ use databend_common_io::prelude::bincode_deserialize_from_slice;
 use databend_common_io::prelude::bincode_serialize_into_buf;
 use ethnum::i256;
 
+use super::sort_aggregate::SortProbeState;
 use crate::read;
 use crate::store;
 use crate::types::binary::BinaryColumn;
@@ -158,6 +159,191 @@ pub unsafe fn serialize_column_to_rowformat(
                 store(
                     &(data.as_ptr() as u64),
                     address[index].add(offset + 4) as *mut u8,
+                );
+            }
+        }
+    }
+}
+
+pub unsafe fn sort_serialize_last_order_col(
+    order_col: &Column,
+    probe_state: &mut SortProbeState,
+    index: usize,
+) {
+    probe_state.last_order_col = Vec::with_capacity(rowformat_size(&order_col.data_type()));
+    let address = probe_state.last_order_col.as_ptr() as *const u8;
+    match order_col {
+        Column::Number(v) => with_number_mapped_type!(|NUM_TYPE| match v {
+            NumberColumn::NUM_TYPE(buffer) => {
+                store(&buffer[index], address as *mut u8);
+            }
+        }),
+        Column::Timestamp(buffer) => {
+            store(&buffer[index], address as *mut u8);
+        }
+        Column::Date(buffer) => {
+            store(&buffer[index], address as *mut u8);
+        }
+        _ => unreachable!(),
+    }
+}
+
+pub unsafe fn sort_serialize_column_to_rowformat(
+    arena: &Bump,
+    column: &Column,
+    probe_state: &mut SortProbeState,
+    offset: usize,
+    scratch: &mut Vec<u8>,
+) {
+    match column {
+        Column::Null { .. } | Column::EmptyArray { .. } | Column::EmptyMap { .. } => {}
+        Column::Number(v) => with_number_mapped_type!(|NUM_TYPE| match v {
+            NumberColumn::NUM_TYPE(buffer) => {
+                for group in probe_state
+                    .group_vector
+                    .iter()
+                    .take(probe_state.group_count)
+                    .copied()
+                {
+                    store(
+                        &buffer[group.index],
+                        probe_state.addresses[group.index].add(offset) as *mut u8,
+                    );
+                }
+            }
+        }),
+        Column::Decimal(v) => {
+            with_decimal_mapped_type!(|DECIMAL_TYPE| match v {
+                DecimalColumn::DECIMAL_TYPE(buffer, _) => {
+                    for group in probe_state
+                        .group_vector
+                        .iter()
+                        .take(probe_state.group_count)
+                        .copied()
+                    {
+                        store(
+                            &buffer[group.index],
+                            probe_state.addresses[group.index].add(offset) as *mut u8,
+                        );
+                    }
+                }
+            })
+        }
+        Column::Boolean(v) => {
+            if v.unset_bits() == 0 || v.unset_bits() == v.len() {
+                let val: u8 = if v.unset_bits() == 0 { 1 } else { 0 };
+                // faster path
+                for group in probe_state
+                    .group_vector
+                    .iter()
+                    .take(probe_state.group_count)
+                    .copied()
+                {
+                    store(
+                        &val,
+                        probe_state.addresses[group.index].add(offset) as *mut u8,
+                    );
+                }
+            } else {
+                for group in probe_state
+                    .group_vector
+                    .iter()
+                    .take(probe_state.group_count)
+                    .copied()
+                {
+                    store(
+                        &(v.get_bit(group.index) as u8),
+                        probe_state.addresses[group.index].add(offset) as *mut u8,
+                    );
+                }
+            }
+        }
+        Column::Binary(v) | Column::Bitmap(v) | Column::Variant(v) | Column::Geometry(v) => {
+            for group in probe_state
+                .group_vector
+                .iter()
+                .take(probe_state.group_count)
+                .copied()
+            {
+                let data = arena.alloc_slice_copy(v.index_unchecked(group.index));
+                store(
+                    &(data.len() as u32),
+                    probe_state.addresses[group.index].add(offset) as *mut u8,
+                );
+                store(
+                    &(data.as_ptr() as u64),
+                    probe_state.addresses[group.index].add(offset + 4) as *mut u8,
+                );
+            }
+        }
+        Column::String(v) => {
+            for group in probe_state
+                .group_vector
+                .iter()
+                .take(probe_state.group_count)
+                .copied()
+            {
+                let data = arena.alloc_str(v.index_unchecked(group.index));
+                store(
+                    &(data.len() as u32),
+                    probe_state.addresses[group.index].add(offset) as *mut u8,
+                );
+                store(
+                    &(data.as_ptr() as u64),
+                    probe_state.addresses[group.index].add(offset + 4) as *mut u8,
+                );
+            }
+        }
+        Column::Timestamp(buffer) => {
+            for group in probe_state
+                .group_vector
+                .iter()
+                .take(probe_state.group_count)
+                .copied()
+            {
+                store(
+                    &buffer[group.index],
+                    probe_state.addresses[group.index].add(offset) as *mut u8,
+                );
+            }
+        }
+        Column::Date(buffer) => {
+            for group in probe_state
+                .group_vector
+                .iter()
+                .take(probe_state.group_count)
+                .copied()
+            {
+                store(
+                    &buffer[group.index],
+                    probe_state.addresses[group.index].add(offset) as *mut u8,
+                );
+            }
+        }
+        Column::Nullable(c) => {
+            sort_serialize_column_to_rowformat(arena, &c.column, probe_state, offset, scratch)
+        }
+
+        // for complex column
+        other => {
+            for group in probe_state
+                .group_vector
+                .iter()
+                .take(probe_state.group_count)
+                .copied()
+            {
+                let s = other.index_unchecked(group.index).to_owned();
+                scratch.clear();
+                bincode_serialize_into_buf(scratch, &s).unwrap();
+
+                let data = arena.alloc_slice_copy(scratch);
+                store(
+                    &(data.len() as u32),
+                    probe_state.addresses[group.index].add(offset) as *mut u8,
+                );
+                store(
+                    &(data.as_ptr() as u64),
+                    probe_state.addresses[group.index].add(offset + 4) as *mut u8,
                 );
             }
         }

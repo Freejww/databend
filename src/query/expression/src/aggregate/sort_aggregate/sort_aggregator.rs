@@ -36,6 +36,7 @@ use crate::with_number_mapped_type;
 use crate::AggregateFunctionRef;
 use crate::Column;
 use crate::ColumnBuilder;
+use crate::DataBlock;
 use crate::Payload;
 use crate::PayloadFlushState;
 use crate::StateAddr;
@@ -110,12 +111,13 @@ impl SortAggregator {
     pub fn execute_one_block(
         &mut self,
         probe_state: &mut SortProbeState,
+        flush_state: &mut PayloadFlushState,
         group_columns: &[Column],
         order_col: &Column,
         params: &[Vec<Column>],
         agg_states: &[Column],
         rows_num: usize,
-    ) -> Result<usize> {
+    ) -> Result<(Vec<DataBlock>, usize)> {
         probe_state.resize(rows_num);
 
         group_hash_columns(
@@ -123,12 +125,13 @@ impl SortAggregator {
             &mut probe_state.group_hashes,
         );
 
-        let group_count = match order_col {
+        let (blocks, group_count) = match order_col {
             // Order_col: Number Date Timestamp String Binary
             Column::Number(v) => with_number_mapped_type!(|NUM_TYPE| match v {
                 NumberColumn::NUM_TYPE(_) => {
                     self.scan::<NumberType<NUM_TYPE>>(
                         probe_state,
+                        flush_state,
                         group_columns,
                         order_col,
                         params,
@@ -139,6 +142,7 @@ impl SortAggregator {
             }),
             Column::Date(_) => self.scan::<DateType>(
                 probe_state,
+                flush_state,
                 group_columns,
                 order_col,
                 params,
@@ -147,6 +151,7 @@ impl SortAggregator {
             )?,
             Column::Timestamp(_) => self.scan::<TimestampType>(
                 probe_state,
+                flush_state,
                 group_columns,
                 order_col,
                 params,
@@ -155,29 +160,44 @@ impl SortAggregator {
             )?,
             Column::String(v) => {
                 let v = &BinaryColumn::from(v.clone());
-                self.scan_binary(probe_state, group_columns, v, params, agg_states, rows_num)?
+                self.scan_binary(
+                    probe_state,
+                    flush_state,
+                    group_columns,
+                    v,
+                    params,
+                    agg_states,
+                    rows_num,
+                )?
             }
-            Column::Binary(v) => {
-                self.scan_binary(probe_state, group_columns, v, params, agg_states, rows_num)?
-            }
+            Column::Binary(v) => self.scan_binary(
+                probe_state,
+                flush_state,
+                group_columns,
+                v,
+                params,
+                agg_states,
+                rows_num,
+            )?,
             _ => unreachable!(),
         };
 
         probe_state.last_is_init = true;
 
         self.group_count += group_count;
-        Ok(group_count)
+        Ok((blocks, group_count))
     }
 
     pub fn scan_binary(
         &mut self,
         probe_state: &mut SortProbeState,
+        flush_state: &mut PayloadFlushState,
         group_columns: &[Column],
         order_col: &BinaryColumn,
         params: &[Vec<Column>],
         agg_states: &[Column],
         rows_num: usize,
-    ) -> Result<usize> {
+    ) -> Result<(Vec<DataBlock>, usize)> {
         // If last block is [1,2,3], and now block is [3,3,4]
         let mut count = 0;
         if probe_state.last_is_init {
@@ -196,6 +216,28 @@ impl SortAggregator {
                 }
             }
         };
+
+        // Current block does not have rows that are the same as the previous block
+        let mut blocks = vec![];
+        if probe_state.last_is_init && count == 0 {
+            flush_state.clear();
+            loop {
+                if self.merge_result(flush_state)? {
+                    let mut cols = flush_state.take_aggregate_results();
+                    cols.extend_from_slice(&flush_state.take_group_columns());
+                    blocks.push(DataBlock::new_from_columns(cols));
+                } else {
+                    break;
+                }
+            }
+
+            let payload = Payload::new(
+                Arc::new(Bump::new()),
+                self.payload.group_types.clone(),
+                self.payload.aggrs.clone(),
+            );
+            let _ = std::mem::replace(&mut self.payload, payload);
+        }
 
         probe_state.equal_last_group = GroupDesc { index: 0, count };
 
@@ -237,7 +279,7 @@ impl SortAggregator {
         self.payload
             .sort_reserve_append_rows(probe_state, group_columns);
 
-        // Record last group hash and address
+        // Last group address and order_col value
         if !all_rows_equal_last_group {
             probe_state.last_group_address = probe_state.addresses[start];
 
@@ -258,18 +300,19 @@ impl SortAggregator {
             self.merge_state(probe_state, params, agg_states, rows_num)?;
         }
 
-        Ok(probe_state.group_count)
+        Ok((blocks, probe_state.group_count))
     }
 
     pub fn scan<T: ArgType>(
         &mut self,
         probe_state: &mut SortProbeState,
+        flush_state: &mut PayloadFlushState,
         group_columns: &[Column],
         order_col: &Column,
         params: &[Vec<Column>],
         agg_states: &[Column],
         rows_num: usize,
-    ) -> Result<usize> {
+    ) -> Result<(Vec<DataBlock>, usize)> {
         let col = T::try_downcast_column(order_col).unwrap();
 
         // If last block is [1,2,3], and now block is [3,3,4]
@@ -288,6 +331,27 @@ impl SortAggregator {
                 }
             }
         };
+
+        let mut blocks = vec![];
+        if probe_state.last_is_init && count == 0 {
+            flush_state.clear();
+            loop {
+                if self.merge_result(flush_state)? {
+                    let mut cols = flush_state.take_aggregate_results();
+                    cols.extend_from_slice(&flush_state.take_group_columns());
+                    blocks.push(DataBlock::new_from_columns(cols));
+                } else {
+                    break;
+                }
+            }
+
+            let payload = Payload::new(
+                Arc::new(Bump::new()),
+                self.payload.group_types.clone(),
+                self.payload.aggrs.clone(),
+            );
+            let _ = std::mem::replace(&mut self.payload, payload);
+        }
 
         probe_state.equal_last_group = GroupDesc { index: 0, count };
 
@@ -342,7 +406,7 @@ impl SortAggregator {
             self.merge_state(probe_state, params, agg_states, rows_num)?;
         }
 
-        Ok(probe_state.group_count)
+        Ok((blocks, probe_state.group_count))
     }
 
     pub fn merge_state(

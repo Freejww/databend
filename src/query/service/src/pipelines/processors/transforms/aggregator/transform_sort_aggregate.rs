@@ -135,24 +135,25 @@ impl AccumulatingTransform for TransformSortAggregate {
         match &mut self.sort_aggregator {
             SortAggregate::MovedOut => unreachable!(),
             SortAggregate::SortAggregator(sort_aggregator) => {
-                let _ = sort_aggregator.execute_one_block(
+                let (blocks, _) = sort_aggregator.execute_one_block(
                     &mut self.probe_state,
+                    &mut self.flush_state,
                     &group_columns,
                     order_col,
                     &params_columns,
                     &agg_states,
                     rows_num,
                 )?;
+                Ok(blocks)
             }
         }
-
-        Ok(vec![])
     }
 
     fn on_finish(&mut self, _output: bool) -> Result<Vec<DataBlock>> {
         let sort_aggregator = std::mem::take(&mut self.sort_aggregator);
         let mut blocks = vec![];
         let mut rows = 0;
+        self.flush_state.clear();
         match sort_aggregator {
             SortAggregate::MovedOut => unreachable!(),
             SortAggregate::SortAggregator(sort_aggregator) => loop {

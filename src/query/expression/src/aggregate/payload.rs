@@ -415,7 +415,7 @@ impl Payload {
         probe_state: &mut SortProbeState,
         group_columns: &[Column],
     ) {
-        // Last group point to last group address
+        // Equal_last_group point to last group address
         for idx in probe_state.equal_last_group.index
             ..probe_state.equal_last_group.index + probe_state.equal_last_group.count
         {

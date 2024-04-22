@@ -209,27 +209,11 @@ impl SortAggregator {
         };
 
         // Current block does not have rows that are the same as the previous block
-        let mut blocks = vec![];
-        if probe_state.last_is_init && count == 0 {
-            flush_state.clear();
-            loop {
-                if self.merge_result(flush_state)? {
-                    let mut cols = flush_state.take_aggregate_results();
-                    cols.extend_from_slice(&flush_state.take_group_columns());
-                    blocks.push(DataBlock::new_from_columns(cols));
-                } else {
-                    break;
-                }
-            }
-
-            let payload = Payload::new(
-                Arc::new(Bump::new()),
-                self.payload.group_types.clone(),
-                self.payload.aggrs.clone(),
-                true,
-            );
-            let _ = std::mem::replace(&mut self.payload, payload);
-        }
+        let blocks = if probe_state.last_is_init && count == 0 {
+            self.flush_result(flush_state)?
+        } else {
+            vec![]
+        };
 
         probe_state.equal_last_group = GroupDesc { index: 0, count };
 
@@ -237,14 +221,12 @@ impl SortAggregator {
         let mut end = count;
 
         let all_rows_equal_last_group = start == rows_num;
+        let mut prev = unsafe { BinaryType::index_column_unchecked(order_col, start) };
+
+        // All rows not same to last group
         if !all_rows_equal_last_group {
             for idx in start + 1..rows_num {
-                let (cur, prev) = unsafe {
-                    (
-                        BinaryType::index_column_unchecked(order_col, idx),
-                        BinaryType::index_column_unchecked(order_col, idx - 1),
-                    )
-                };
+                let cur = unsafe { BinaryType::index_column_unchecked(order_col, idx) };
 
                 let equal = fast_memcmp(cur, prev);
                 if !equal {
@@ -256,6 +238,7 @@ impl SortAggregator {
                     probe_state.group_count += 1;
 
                     start = idx;
+                    prev = cur;
                 }
                 end = idx;
             }
@@ -324,43 +307,25 @@ impl SortAggregator {
             }
         };
 
-        let mut blocks = vec![];
-        if probe_state.last_is_init && count == 0 {
-            flush_state.clear();
-            loop {
-                if self.merge_result(flush_state)? {
-                    let mut cols = flush_state.take_aggregate_results();
-                    cols.extend_from_slice(&flush_state.take_group_columns());
-                    blocks.push(DataBlock::new_from_columns(cols));
-                } else {
-                    break;
-                }
-            }
-
-            let payload = Payload::new(
-                Arc::new(Bump::new()),
-                self.payload.group_types.clone(),
-                self.payload.aggrs.clone(),
-                true,
-            );
-            let _ = std::mem::replace(&mut self.payload, payload);
-        }
+        // Current block does not have rows that are the same as the previous block
+        let blocks = if probe_state.last_is_init && count == 0 {
+            self.flush_result(flush_state)?
+        } else {
+            vec![]
+        };
 
         probe_state.equal_last_group = GroupDesc { index: 0, count };
 
         let mut start = count;
         let mut end = count;
 
-        // All rows not same
         let all_rows_equal_last_group = start == rows_num;
+        let mut prev = unsafe { T::to_owned_scalar(T::index_column_unchecked(&col, start)) };
+
+        // All rows not same to last group
         if !all_rows_equal_last_group {
             for idx in start + 1..rows_num {
-                let (cur, prev) = unsafe {
-                    (
-                        T::to_owned_scalar(T::index_column_unchecked(&col, idx)),
-                        T::to_owned_scalar(T::index_column_unchecked(&col, idx - 1)),
-                    )
-                };
+                let cur = unsafe { T::to_owned_scalar(T::index_column_unchecked(&col, idx)) };
                 if !cur.eq(&prev) {
                     // Find a new group
                     probe_state.group_vector[probe_state.group_count] = GroupDesc {
@@ -370,6 +335,7 @@ impl SortAggregator {
                     probe_state.group_count += 1;
 
                     start = idx;
+                    prev = cur;
                 }
                 end = idx;
             }
@@ -468,5 +434,31 @@ impl SortAggregator {
             return Ok(true);
         }
         Ok(false)
+    }
+
+    pub fn flush_result(&mut self, flush_state: &mut PayloadFlushState) -> Result<Vec<DataBlock>> {
+        let mut blocks = vec![];
+        flush_state.clear();
+
+        loop {
+            if self.merge_result(flush_state)? {
+                let mut cols = flush_state.take_aggregate_results();
+                cols.extend_from_slice(&flush_state.take_group_columns());
+                blocks.push(DataBlock::new_from_columns(cols));
+            } else {
+                break;
+            }
+        }
+
+        let payload = Payload::new(
+            Arc::new(Bump::new()),
+            self.payload.group_types.clone(),
+            self.payload.aggrs.clone(),
+            true,
+        );
+        let _ = std::mem::replace(&mut self.payload, payload);
+        self.group_count = 0;
+
+        Ok(blocks)
     }
 }

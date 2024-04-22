@@ -61,7 +61,7 @@ impl PartitionedPayload {
         debug_assert_eq!(1 << radix_bits, partition_count);
 
         let payloads = (0..partition_count)
-            .map(|_| Payload::new(arenas[0].clone(), group_types.clone(), aggrs.clone()))
+            .map(|_| Payload::new(arenas[0].clone(), group_types.clone(), aggrs.clone(), false))
             .collect_vec();
 
         let group_sizes = payloads[0].group_sizes.clone();

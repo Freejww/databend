@@ -20,7 +20,6 @@ use databend_common_exception::Result;
 use databend_common_hashtable::fast_memcmp;
 
 use crate::aggregate::payload_row::sort_serialize_last_order_col;
-use crate::group_hash_columns;
 use crate::read;
 use crate::store;
 use crate::types::binary::BinaryColumn;
@@ -49,7 +48,6 @@ pub struct GroupDesc {
 
 pub struct SortProbeState {
     pub group_vector: Vec<GroupDesc>,
-    pub group_hashes: Vec<u64>,
     pub addresses: Vec<*const u8>,
     pub state_places: Vec<StateAddr>,
     pub group_count: usize,
@@ -63,7 +61,6 @@ impl Default for SortProbeState {
     fn default() -> Self {
         Self {
             group_vector: vec![],
-            group_hashes: vec![],
             addresses: vec![],
             state_places: vec![],
             group_count: 0,
@@ -78,7 +75,6 @@ impl Default for SortProbeState {
 impl SortProbeState {
     pub fn resize(&mut self, rows_num: usize) {
         self.group_vector.resize(rows_num, GroupDesc::default());
-        self.group_hashes.resize(rows_num, 0);
         self.addresses.resize(rows_num, std::ptr::null::<u8>());
         self.state_places.resize(rows_num, StateAddr::new(0));
         self.group_count = 0;
@@ -103,7 +99,7 @@ impl SortAggregator {
         arena: Arc<Bump>,
     ) -> Self {
         Self {
-            payload: Payload::new(arena, group_types, aggrs),
+            payload: Payload::new(arena, group_types, aggrs, true),
             group_count: 0,
         }
     }
@@ -119,11 +115,6 @@ impl SortAggregator {
         rows_num: usize,
     ) -> Result<(Vec<DataBlock>, usize)> {
         probe_state.resize(rows_num);
-
-        group_hash_columns(
-            std::slice::from_ref(order_col),
-            &mut probe_state.group_hashes,
-        );
 
         let (blocks, group_count) = match order_col {
             // Order_col: Number Date Timestamp String Binary
@@ -235,6 +226,7 @@ impl SortAggregator {
                 Arc::new(Bump::new()),
                 self.payload.group_types.clone(),
                 self.payload.aggrs.clone(),
+                true,
             );
             let _ = std::mem::replace(&mut self.payload, payload);
         }
@@ -349,6 +341,7 @@ impl SortAggregator {
                 Arc::new(Bump::new()),
                 self.payload.group_types.clone(),
                 self.payload.aggrs.clone(),
+                true,
             );
             let _ = std::mem::replace(&mut self.payload, payload);
         }

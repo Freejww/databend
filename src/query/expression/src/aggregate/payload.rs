@@ -90,6 +90,7 @@ impl Payload {
         arena: Arc<Bump>,
         group_types: Vec<DataType>,
         aggrs: Vec<AggregateFunctionRef>,
+        is_sort_aggregate: bool,
     ) -> Self {
         let mut state_addr_offsets = Vec::new();
         let state_layout = if !aggrs.is_empty() {
@@ -121,7 +122,8 @@ impl Payload {
 
         let hash_offset = tuple_size;
 
-        let hash_size = 8;
+        // sort aggregate don't write hash
+        let hash_size = if is_sort_aggregate { 0 } else { 8 };
         tuple_size += hash_size;
 
         let state_offset = tuple_size;
@@ -508,21 +510,8 @@ impl Payload {
             write_offset += self.group_sizes[idx];
         }
 
-        // write group hashes
+        // sort aggregate don't write hash
         debug_assert!(write_offset == self.hash_offset);
-        for group in probe_state
-            .group_vector
-            .iter()
-            .take(probe_state.group_count)
-            .copied()
-        {
-            unsafe {
-                let dst = probe_state.addresses[group.index].add(write_offset);
-                store::<u64>(&probe_state.group_hashes[group.index], dst as *mut u8);
-            }
-        }
-
-        write_offset += 8;
         debug_assert!(write_offset == self.state_offset);
         if let Some(layout) = self.state_layout {
             // write states

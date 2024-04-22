@@ -92,6 +92,10 @@ impl Processor for TransformSortAggregateShuffle {
             return Ok(Event::NeedConsume);
         }
 
+        if self.input_data.is_some() {
+            return Ok(Event::Sync);
+        }
+
         if self.input.has_data() {
             self.input_data = Some(self.input.pull_data().unwrap()?);
             return Ok(Event::Sync);
@@ -103,6 +107,7 @@ impl Processor for TransformSortAggregateShuffle {
 
     fn process(&mut self) -> Result<()> {
         if let Some(data_block) = self.input_data.take() {
+            // Need re-design, if most order_col is same, most data will send to one output
             let num_rows = data_block.num_rows();
             let output_len = self.outputs.len();
             let order_col = data_block.get_last_column();

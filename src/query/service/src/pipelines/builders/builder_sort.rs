@@ -361,7 +361,8 @@ impl SortPipelineBuilder {
         })?;
 
         if may_spill {
-            let config = SpillerConfig::create(query_spill_prefix(self.ctx.get_tenant().name()));
+            let config =
+                SpillerConfig::create(query_spill_prefix(self.ctx.get_tenant().tenant_name()));
             pipeline.add_transform(|input, output| {
                 let op = DataOperator::instance().operator();
                 let spiller =

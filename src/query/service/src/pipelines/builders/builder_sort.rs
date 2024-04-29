@@ -24,6 +24,7 @@ use databend_common_pipeline_core::PipeItem;
 use databend_common_pipeline_core::Pipeline;
 use databend_common_pipeline_transforms::processors::sort::utils::add_order_field;
 use databend_common_pipeline_transforms::processors::try_add_multi_sort_merge;
+use databend_common_pipeline_transforms::processors::TransformSortAggregateSchedule;
 use databend_common_pipeline_transforms::processors::TransformSortAggregateShuffle;
 use databend_common_pipeline_transforms::processors::TransformSortMergeBuilder;
 use databend_common_pipeline_transforms::processors::TransformSortPartial;
@@ -320,6 +321,25 @@ impl SortPipelineBuilder {
     }
 
     pub fn build_sort_and_shuffle_pipeline(self, pipeline: &mut Pipeline) -> Result<()> {
+        let output_len = pipeline.output_len();
+        let rules: Vec<usize> = (0..output_len).collect();
+        if output_len > 1 {
+            pipeline.add_transform(|input, output| {
+                Ok(ProcessorPtr::create(
+                    TransformSortAggregateShuffle::try_create(input, output, output_len)?,
+                ))
+            })?;
+
+            let transform =
+                TransformSortAggregateSchedule::create(output_len, output_len, output_len);
+
+            let inputs = transform.get_inputs();
+            let outputs = transform.get_outputs();
+            pipeline.add_pipe(Pipe::create(output_len, output_len, vec![
+                PipeItem::create(ProcessorPtr::create(Box::new(transform)), inputs, outputs),
+            ]));
+        }
+
         // Partial sort
         pipeline.add_transform(|input, output| {
             Ok(ProcessorPtr::create(TransformSortPartial::try_create(
@@ -378,30 +398,6 @@ impl SortPipelineBuilder {
                 )))
             })?;
         }
-
-        if need_multi_merge {
-            // Multi-pipelines merge sort
-            try_add_multi_sort_merge(
-                pipeline,
-                sort_merge_output_schema,
-                self.final_block_size,
-                self.limit,
-                self.sort_desc,
-                self.remove_order_col_at_last,
-            )?;
-        }
-
-        debug_assert!(pipeline.output_len() == 1);
-        // Shuffle
-        let transform = TransformSortAggregateShuffle::create(output_len)?;
-        let input = transform.get_input();
-        let outputs = transform.get_outputs();
-
-        pipeline.add_pipe(Pipe::create(1, output_len, vec![PipeItem::create(
-            ProcessorPtr::create(Box::new(transform)),
-            vec![input],
-            outputs,
-        )]));
 
         Ok(())
     }

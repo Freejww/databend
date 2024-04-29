@@ -23,6 +23,7 @@ mod transform_blocking;
 mod transform_compact;
 mod transform_dummy;
 mod transform_multi_sort_merge;
+mod transform_sort_agg_schedule;
 mod transform_sort_merge_base;
 mod transform_sort_shuffle;
 
@@ -39,6 +40,7 @@ pub use transform_blocking::*;
 pub use transform_compact::*;
 pub use transform_dummy::*;
 pub use transform_multi_sort_merge::try_add_multi_sort_merge;
+pub use transform_sort_agg_schedule::*;
 pub use transform_sort_merge::sort_merge;
 pub use transform_sort_merge::*;
 pub use transform_sort_merge_base::*;

@@ -12,125 +12,116 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::any::Any;
 use std::sync::Arc;
-
+use databend_common_expression::BlockMetaInfo;
 use databend_common_exception::Result;
 use databend_common_expression::group_hash_columns;
 use databend_common_expression::DataBlock;
-use databend_common_pipeline_core::processors::Event;
 use databend_common_pipeline_core::processors::InputPort;
 use databend_common_pipeline_core::processors::OutputPort;
 use databend_common_pipeline_core::processors::Processor;
 use strength_reduce::StrengthReducedU64;
+
+use crate::processors::Transform;
+use crate::processors::Transformer;
+
 pub struct TransformSortAggregateShuffle {
-    input: Arc<InputPort>,
-    outputs: Vec<Arc<OutputPort>>,
-    input_data: Option<DataBlock>,
-    outputs_data: Vec<Option<DataBlock>>,
+    shuffle_nums: usize,
 }
 
 impl TransformSortAggregateShuffle {
-    pub fn create(output_len: usize) -> Result<Self> {
-        let input = InputPort::create();
-        let outputs = (0..output_len).map(|_| OutputPort::create()).collect();
-        let outputs_data = (0..output_len).map(|_| None).collect();
-
-        Ok(Self {
+    pub fn try_create(
+        input: Arc<InputPort>,
+        output: Arc<OutputPort>,
+        shuffle_nums: usize,
+    ) -> Result<Box<dyn Processor>> {
+        Ok(Transformer::create(
             input,
-            outputs,
-            input_data: None,
-            outputs_data,
-        })
+            output,
+            TransformSortAggregateShuffle { shuffle_nums },
+        ))
     }
 
-    pub fn get_input(&self) -> Arc<InputPort> {
-        self.input.clone()
-    }
-    pub fn get_outputs(&self) -> Vec<Arc<OutputPort>> {
-        self.outputs.clone()
+
+}
+
+#[async_trait::async_trait]
+impl Transform for TransformSortAggregateShuffle {
+    const NAME: &'static str = "SortAggregateShuffle";
+
+    fn transform(&mut self, block: DataBlock) -> Result<DataBlock> {
+        shuffle(block, self.shuffle_nums)
     }
 }
 
-impl Processor for TransformSortAggregateShuffle {
-    fn name(&self) -> String {
-        "SortAggregateShuffle".to_string()
+pub fn shuffle(data_block: DataBlock, shuffle_nums: usize) -> Result<DataBlock> {
+    let num_rows = data_block.num_rows();
+    let last_col = data_block.get_last_column();
+    let col = std::slice::from_ref(last_col);
+    let mut hashes = vec![0_u64; num_rows];
+    group_hash_columns(col, &mut hashes);
+
+    // Shuffle by output_len
+    let mut indices = Vec::with_capacity(num_rows);
+    let mods = StrengthReducedU64::new(shuffle_nums as u64);
+    for hash in hashes {
+        indices.push((hash % mods) as u8);
     }
 
-    fn as_any(&mut self) -> &mut dyn Any {
-        self
+    let scatter_blocks = DataBlock::scatter(&data_block, &indices, shuffle_nums)?;
+
+    Ok(ShuffleBlocks::create_block(scatter_blocks, shuffle_nums))
+}
+
+#[derive(Debug)]
+pub struct ShuffleBlocks {
+    pub shuffle_nums: usize,
+    pub blocks: Vec<DataBlock>,
+}
+
+impl ShuffleBlocks {
+    pub fn create_block(blocks: Vec<DataBlock>, shuffle_nums: usize) -> DataBlock {
+        DataBlock::empty_with_meta(Box::new(ShuffleBlocks {
+            blocks,
+            shuffle_nums,
+        }))
+    }
+}
+
+impl Clone for ShuffleBlocks {
+    fn clone(&self) -> Self {
+        unreachable!("ShuffleBlocks should not be cloned")
+    }
+}
+
+impl serde::Serialize for ShuffleBlocks {
+    fn serialize<S>(&self, _: S) -> Result<S::Ok, S::Error>
+    where S: serde::Serializer {
+        unreachable!("ShuffleBlocks should not be serialized")
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for ShuffleBlocks {
+    fn deserialize<D>(_: D) -> Result<Self, D::Error>
+    where D: serde::Deserializer<'de> {
+        unreachable!("ShuffleBlocks should not be deserialized")
+    }
+}
+
+impl BlockMetaInfo for ShuffleBlocks {
+    fn typetag_deserialize(&self) {
+        unimplemented!("ShuffleBlocks does not support exchanging between multiple nodes")
     }
 
-    fn event(&mut self) -> Result<Event> {
-        let all_finished = self.outputs.iter().all(|x| x.is_finished());
-
-        if all_finished {
-            self.input.finish();
-            return Ok(Event::Finished);
-        }
-
-        if self.input.is_finished() {
-            self.outputs.iter_mut().for_each(|x| x.finish());
-            return Ok(Event::Finished);
-        }
-
-        if self
-            .outputs
-            .iter()
-            .any(|x| !x.is_finished() && !x.can_push())
-        {
-            self.input.set_not_need_data();
-            return Ok(Event::NeedConsume);
-        }
-
-        if self.outputs_data.iter().any(|x| x.is_some()) {
-            for i in 0..self.outputs.len() {
-                if let Some(output_data) = self.outputs_data[i].take() {
-                    self.outputs[i].push_data(Ok(output_data));
-                }
-            }
-            return Ok(Event::NeedConsume);
-        }
-
-        if self.input_data.is_some() {
-            return Ok(Event::Sync);
-        }
-
-        if self.input.has_data() {
-            self.input_data = Some(self.input.pull_data().unwrap()?);
-            return Ok(Event::Sync);
-        }
-
-        self.input.set_need_data();
-        Ok(Event::NeedData)
+    fn typetag_name(&self) -> &'static str {
+        unimplemented!("ShuffleBlocks does not support exchanging between multiple nodes")
     }
 
-    fn process(&mut self) -> Result<()> {
-        if let Some(data_block) = self.input_data.take() {
-            // Need re-design, if most order_col is same, most data will send to one output
-            let num_rows = data_block.num_rows();
-            let output_len = self.outputs.len();
-            let order_col = data_block.get_last_column();
-            let col = std::slice::from_ref(order_col);
-            let mut hashes = vec![0_u64; num_rows];
-            group_hash_columns(col, &mut hashes);
+    fn equals(&self, _: &Box<dyn BlockMetaInfo>) -> bool {
+        unimplemented!("Unimplemented equals for ShuffleBlocks")
+    }
 
-            // Shuffle by output_len
-            let mut indices = Vec::with_capacity(num_rows);
-            let mods = StrengthReducedU64::new(output_len as u64);
-            for hash in hashes {
-                indices.push((hash % mods) as u8);
-            }
-
-            let scatter_blocks = DataBlock::scatter(&data_block, &indices, output_len)?;
-
-            for (idx, data_block) in scatter_blocks.into_iter().enumerate() {
-                self.outputs_data[idx] = match data_block.is_empty() {
-                    true => None,
-                    false => Some(data_block),
-                }
-            }
-        }
-        Ok(())
+    fn clone_self(&self) -> Box<dyn BlockMetaInfo> {
+        unimplemented!("Unimplemented clone for ShuffleBlocks")
     }
 }
